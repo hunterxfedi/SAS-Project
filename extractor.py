@@ -2,136 +2,158 @@ import os
 import re
 import pandas as pd
 
-declared_libs = set()  # Will store all libnames defined
+declared_libs = set()
 
-def extract_from_file(file_path):
-    results = []
+CONTROL_KEYWORDS = {
+    "if", "then", "else", "do", "end", "put", "goto", "abort", "return",
+    "symdel", "until", "while", "scan", "substr", "eval", "upcase", "lowcase",
+    "index", "find", "length", "sysfunc", "sysget"
+}
 
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
-        for line in lines:
-            clean_line = line.strip().lower()
-            if clean_line == "" or clean_line.startswith("*"):
-                continue
+def read_sas_file(filepath):
+    with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+        content = f.read()
+    content = re.sub(r'/\*.*?\*/', '', content, flags=re.DOTALL)
+    content = re.sub(r'^\s*\*.*?;', '', content, flags=re.MULTILINE)
+    return content.lower()
 
-            row = {
-                "statement": clean_line,
-                "file_path": file_path,
-                "INCLUDE": "",
-                "INCLUDE_PATH": "",
-                "DEPENDENCY_EXISTS": "",
-                "LIBNAME": "",
-                "MACRO_DEF": "",
-                "MACRO_CALL": "",
-                "tables_sourcejoin": "",
-                "tables_table": "",
-                "source": "",
-                "input_table": "",
-                "output_table": "",
-                "WRITE_BACK": "No",
-                "MISSING_LIBNAME": ""
-            }
+def extract_all_blocks(code, filepath):
+    rows = []
 
-            # %include "file.sas";
-            include_path = re.search(r'%include\s+["\'](.+?)["\']', clean_line)
-            if include_path:
-                row["INCLUDE"] = "yes"
-                include_file = include_path.group(1)
-                row["INCLUDE_PATH"] = include_file
-                full_include_path = os.path.join("SAS Files", os.path.basename(include_file))
-                row["DEPENDENCY_EXISTS"] = "Yes" if os.path.isfile(full_include_path) else "No"
+    # %INCLUDE
+    for inc in re.findall(r'%include\s+["\'](.+?)["\']\s*;', code):
+        rows.append({
+            "statement": f"%include \"{inc}\";",
+            "INCLUDE_PATH": inc,
+            "DEPENDENCY_EXISTS": "Yes" if os.path.isfile(os.path.join("SAS Files", os.path.basename(inc))) else "No",
+            "file_path": filepath
+        })
 
-            # libname libref 'path';
-            lib = re.search(r'libname\s+(\w+)\s+["\']([^"\']+)["\']', clean_line)
-            if lib:
-                libref = lib.group(1)
-                declared_libs.add(libref.lower())
-                row["LIBNAME"] = libref
-                row["source"] = lib.group(2)
+    # %LET
+    for var, val in re.findall(r'%let\s+(\w+)\s*=\s*([^;]+);', code):
+        rows.append({
+            "statement": f"%let {var}={val};",
+            "LET_STATEMENT": var,
+            "file_path": filepath
+        })
 
-            # %macro macroname(...)
-            macro_def = re.search(r'%macro\s+(\w+)', clean_line)
-            if macro_def:
-                row["MACRO_DEF"] = macro_def.group(1)
+    # %MACRO CALLS
+    for name, args in re.findall(r'%(\w+)\s*\((.*?)\)\s*;', code):
+        if name not in CONTROL_KEYWORDS:
+            rows.append({
+                "statement": f"%{name}({args});",
+                "MACRO_CALL": name,
+                "file_path": filepath
+            })
 
-            # %macro_call(...)
-            macro_call = re.search(r'%(\w+)\((.*?)\)', clean_line)
-            if macro_call:
-                row["MACRO_CALL"] = macro_call.group(1)
+    # LIBNAME
+    for libref, path in re.findall(r'libname\s+(\w+)\s+["\']([^"\']+)["\'];', code):
+        declared_libs.add(libref)
 
-            # data output.table;
-            data_ = re.search(r'data\s+(\w+)\.(\w+)', clean_line)
-            if data_:
-                libref = data_.group(1)
-                tablename = data_.group(2)
-                row["output_table"] = f"{libref}.{tablename}"
-                row["tables_table"] = tablename
+    # Input Tables: SET, FROM, JOIN
+    for m in re.findall(r'set\s+(\w+)\.(\w+)', code):
+        rows.append({
+            "statement": f"set {m[0]}.{m[1]}",
+            "Input tables": f"{m[0]}.{m[1]}",
+            "tables_sourcejoin": m[1],
+            "file_path": filepath
+        })
 
-                # Write-back check (lib ≠ work)
-                if libref != "work":
-                    row["WRITE_BACK"] = "Yes"
+    for m in re.findall(r'(?:from|join)\s+(\w+)\.(\w+)', code):
+        rows.append({
+            "statement": f"read {m[0]}.{m[1]}",
+            "Input tables": f"{m[0]}.{m[1]}",
+            "tables_sourcejoin": m[1],
+            "file_path": filepath
+        })
 
-                # Check for missing libname
-                if libref not in declared_libs:
-                    row["MISSING_LIBNAME"] = "Yes"
-                else:
-                    row["MISSING_LIBNAME"] = "No"
+    # Output Tables: DATA or CREATE TABLE
+    for m in re.findall(r'(data|create\s+table)\s+(\w+)\.(\w+)', code):
+        rows.append({
+            "statement": f"{m[1]}.{m[2]}",
+            "output_table": f"{m[1]}.{m[2]}",
+            "WRITE_BACK": "Yes",
+            "file_path": filepath
+        })
 
-            # set lib.table;
-            set_ = re.search(r'set\s+(\w+)\.(\w+)', clean_line)
-            if set_:
-                libref = set_.group(1)
-                tablename = set_.group(2)
-                row["input_table"] = f"{libref}.{tablename}"
-                row["tables_sourcejoin"] = tablename
-                if libref not in declared_libs:
-                    row["MISSING_LIBNAME"] = "Yes"
-                else:
-                    row["MISSING_LIBNAME"] = "No"
+    # MERGE
+    for block in re.findall(r'data\s+.*?run\s*;', code, flags=re.DOTALL | re.IGNORECASE):
+        match = re.search(r'merge\s+(.*?);', block, flags=re.IGNORECASE)
+        if match:
+            merge_line = match.group(1)
+            raw_tables = re.findall(r'([a-zA-Z_][\w.]*)\s*(?=\(|\s|$)', merge_line)
+            ignore_keywords = {"by", "in", "keep", "rename", "=", "then", "else", "do", "and", "or", "where", "into", "the", "to"}
+            cleaned = [t for t in raw_tables if t.lower() not in ignore_keywords]
+            rows.append({
+                "statement": f"merge {merge_line};",
+                "tables_sourcejoin": ", ".join(cleaned),
+                "file_path": filepath
+            })
 
-            # merge table1 table2;
-            merge_ = re.search(r'merge\s+(.+);', clean_line)
-            if merge_:
-                merged_tables = merge_.group(1).split()
-                row["tables_sourcejoin"] = ", ".join(merged_tables)
+    # PROC SQL: CREATE TABLE
+    for sql_block in re.findall(r'proc\s+sql.*?quit;', code, flags=re.DOTALL):
+        if "create table" in sql_block:
+            match = re.search(r'create\s+table\s+(\w+\.\w+)', sql_block)
+            if match:
+                out_table = match.group(1)
+                rows.append({
+                    "statement": "proc sql ...",
+                    "output_table": out_table,
+                    "WRITE_BACK": "Yes",
+                    "file_path": filepath
+                })
 
-            # proc sql create table lib.table as ...
-            sql_ = re.search(r'create\s+table\s+(\w+)\.(\w+)', clean_line)
-            if sql_:
-                libref = sql_.group(1)
-                tablename = sql_.group(2)
-                row["output_table"] = f"{libref}.{tablename}"
-                row["tables_table"] = tablename
+    # PROC SORT/TRANSPOSE/MEANS/SUMMARY with OUT=
+    for proc in ["sort", "transpose", "means", "summary"]:
+        pattern = rf'proc\s+{proc}\s+.*?out\s*=\s*(\w+\.\w+|\w+)'
+        for out in re.findall(pattern, code, flags=re.DOTALL):
+            rows.append({
+                "statement": f"proc {proc} out={out}",
+                "output_table": out,
+                "WRITE_BACK": "Yes",
+                "file_path": filepath
+            })
 
-                if libref != "work":
-                    row["WRITE_BACK"] = "Yes"
+    # PROC IMPORT (external input = write-back to dataset)
+    for match in re.findall(r'proc\s+import\s+datafile\s*=\s*["\'](.+?)["\'].*?out\s*=\s*(\w+)', code, flags=re.DOTALL):
+        rows.append({
+            "statement": f"proc import out={match[1]}",
+            "Input tables": match[0],
+            "import proc": "Yes",
+            "WRITE_BACK": "Yes",
+            "file_path": filepath
+        })
 
-                if libref not in declared_libs:
-                    row["MISSING_LIBNAME"] = "Yes"
-                else:
-                    row["MISSING_LIBNAME"] = "No"
+    # PROC EXPORT (write-back to file)
+    for match in re.findall(r'proc\s+export\s+data\s*=\s*(\w+).*?outfile\s*=\s*["\'](.+?)["\']', code, flags=re.DOTALL):
+        rows.append({
+            "statement": f"proc export data={match[0]}",
+            "output_table": match[1],
+            "export proc": "Yes",
+            "WRITE_BACK": "Yes",
+            "file_path": filepath
+        })
 
-            results.append(row)
-
-    return results
-
+    return rows
 
 def main():
     base_dir = "SAS Files"
     all_results = []
 
+    if not os.path.isdir(base_dir):
+        print("❌ 'SAS Files' folder not found.")
+        return
+
     for filename in os.listdir(base_dir):
         if filename.endswith(".sas"):
-            file_path = os.path.join(base_dir, filename)
+            path = os.path.join(base_dir, filename)
             print(f"📄 Processing: {filename}")
-            extracted = extract_from_file(file_path)
-            all_results.extend(extracted)
+            code = read_sas_file(path)
+            all_results.extend(extract_all_blocks(code, path))
 
     df = pd.DataFrame(all_results)
-    df.to_csv("pgm_analysis.csv", index=False)
-    print(f"\n✅ Done! Extracted {len(all_results)} rows into 'pgm_analysis.csv'")
-
+    df.to_excel("final_analysis.xlsx", index=False)
+    print(f"\n✅ Done! Extracted {len(all_results)} rows into 'final_analysis.xlsx'")
 
 if __name__ == "__main__":
     main()
-
