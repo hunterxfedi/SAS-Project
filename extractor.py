@@ -55,39 +55,56 @@ def extract_all_blocks(code, filepath):
             rows.append({
                 "statement": f"merge {merge_line};",
                 "tables_sourcejoin": ", ".join(cleaned),
-                
                 "file_path": filepath
             })
 
-    # DATA step WRITE-BACK
-    for match in re.findall(r'data\s+([\w&]+)\.([\w&]+).*?;', code, flags=re.IGNORECASE):
-        full = f"{match[0]}.{match[1]}"
-        rows.append({
-            "statement": f"data {full}",
-            "output_table": full,
-            "WRITE_BACK": "Yes",
-            
-            "file_path": filepath
-        })
+    # IMPROVED DATA step WRITE-BACK
+    for match in re.finditer(r'data\s+((?:[\w&]+\.)?[\w&]+)(?:\s*\(.*?\))?\s*;', code, flags=re.IGNORECASE):
+        dataset_name = match.group(1).strip()
+        
+        # Skip DATA _NULL_ as it doesn't create datasets
+        if dataset_name.lower() != "_null_":
+            rows.append({
+                "statement": f"data {dataset_name};",
+                "output_table": dataset_name,
+                "WRITE_BACK": "Yes",
+                "write_back_type": "DATA_STEP",
+                "file_path": filepath
+            })
 
-    # ✅ PROC SQL - always WRITE_BACK
+    # IMPROVED PROC SQL
     for sql_block in re.findall(r'proc\s+sql.*?quit;', code, flags=re.IGNORECASE | re.DOTALL):
+        # First line for SQL procedure detection
         first_line = sql_block.strip().splitlines()[0] if sql_block.strip() else "proc sql;"
-        output_table = None
-
-        # Optional CREATE TABLE
-        create_match = re.search(r'create\s+table\s+([\w&]+\.[\w&]+)', sql_block, flags=re.IGNORECASE)
-        if create_match:
-            output_table = create_match.group(1)
-
         rows.append({
             "statement": first_line,
-            "output_table": output_table,
-            "WRITE_BACK": "Yes",  # force write-back
+            "WRITE_BACK": "Yes",
             "file_path": filepath
         })
+        
+        # Look for CREATE TABLE statements
+        for match in re.finditer(r'create\s+table\s+((?:[\w&]+\.)?[\w&]+)', sql_block, flags=re.IGNORECASE):
+            table_name = match.group(1)
+            rows.append({
+                "statement": f"create table {table_name}",
+                "output_table": table_name,
+                "WRITE_BACK": "Yes",
+                "write_back_type": "PROC_SQL_CREATE",
+                "file_path": filepath
+            })
+        
+        # Look for INSERT INTO statements
+        for match in re.finditer(r'insert\s+into\s+((?:[\w&]+\.)?[\w&]+)', sql_block, flags=re.IGNORECASE):
+            table_name = match.group(1)
+            rows.append({
+                "statement": f"insert into {table_name}",
+                "output_table": table_name,
+                "WRITE_BACK": "Yes",
+                "write_back_type": "PROC_SQL_INSERT",
+                "file_path": filepath
+            })
 
-        # FROM / JOIN inputs
+        # FROM / JOIN inputs (keep existing - these are NOT write-backs)
         for keyword, libref, table in re.findall(r'(from|join)\s+(\w+)\.(\w+)', sql_block, flags=re.IGNORECASE):
             rows.append({
                 "statement": f"{keyword.lower()} {libref}.{table}",
@@ -96,56 +113,116 @@ def extract_all_blocks(code, filepath):
                 "file_path": filepath
             })
 
-    # Other PROCs with OUT= or CREATE TABLE
-    for proc_block in re.findall(r'(proc\s+([\w]+).*?)(run;|quit;)', code, flags=re.IGNORECASE | re.DOTALL):
-        full_block, proc_name, _ = proc_block
-        proc_name = proc_name.lower()
+    # PROC SORT with OUT= (NEW)
+    for match in re.finditer(r'proc\s+sort\s+data\s*=\s*([\w&\.]+).*?out\s*=\s*([\w&\.]+)', code, flags=re.IGNORECASE | re.DOTALL):
+        output_table = match.group(2)
+        rows.append({
+            "statement": f"proc sort out={output_table}",
+            "output_table": output_table,
+            "WRITE_BACK": "Yes",
+            "write_back_type": "PROC_SORT",
+            "file_path": filepath
+        })
 
-        if proc_name in {"import", "export"}:
-            continue
+    # PROC MEANS/SUMMARY with OUT= (IMPROVED)
+    for match in re.finditer(r'proc\s+(means|summary)\s+.*?out\s*=\s*([\w&\.]+)', code, flags=re.IGNORECASE | re.DOTALL):
+        proc_name = match.group(1)
+        output_table = match.group(2)
+        rows.append({
+            "statement": f"proc {proc_name} out={output_table}",
+            "output_table": output_table,
+            "WRITE_BACK": "Yes",
+            "write_back_type": f"PROC_{proc_name.upper()}",
+            "file_path": filepath
+        })
 
-        has_out = re.search(r'\bout\s*=\s*([\w&\.]+)', full_block, re.IGNORECASE)
-        has_create = re.search(r'create\s+table\s+([\w&]+\.[\w&]+)', full_block, re.IGNORECASE)
-        output_table = has_out.group(1) if has_out else (has_create.group(1) if has_create else None)
+    # PROC FREQ with OUT= (NEW)
+    for match in re.finditer(r'proc\s+freq\s+.*?out\s*=\s*([\w&\.]+)', code, flags=re.IGNORECASE | re.DOTALL):
+        output_table = match.group(1)
+        rows.append({
+            "statement": f"proc freq out={output_table}",
+            "output_table": output_table,
+            "WRITE_BACK": "Yes",
+            "write_back_type": "PROC_FREQ",
+            "file_path": filepath
+        })
 
-        if output_table:
-            first_line = full_block.strip().split("\n")[0].strip()
+    # PROC TRANSPOSE with OUT= (NEW)
+    for match in re.finditer(r'proc\s+transpose\s+.*?out\s*=\s*([\w&\.]+)', code, flags=re.IGNORECASE | re.DOTALL):
+        output_table = match.group(1)
+        rows.append({
+            "statement": f"proc transpose out={output_table}",
+            "output_table": output_table,
+            "WRITE_BACK": "Yes",
+            "write_back_type": "PROC_TRANSPOSE",
+            "file_path": filepath
+        })
+
+    # PROC APPEND (NEW)
+    for match in re.finditer(r'proc\s+append\s+.*?base\s*=\s*([\w&\.]+)', code, flags=re.IGNORECASE | re.DOTALL):
+        base_table = match.group(1)
+        rows.append({
+            "statement": f"proc append base={base_table}",
+            "output_table": base_table,
+            "WRITE_BACK": "Yes",
+            "write_back_type": "PROC_APPEND",
+            "file_path": filepath
+        })
+
+    # PROC DATASETS MODIFY (NEW)
+    for dataset_block in re.findall(r'proc\s+datasets.*?quit;', code, flags=re.IGNORECASE | re.DOTALL):
+        for match in re.finditer(r'modify\s+([\w&\.]+)', dataset_block, flags=re.IGNORECASE):
+            table_name = match.group(1)
             rows.append({
-                "statement": first_line,
-                "output_table": output_table,
+                "statement": f"proc datasets modify {table_name}",
+                "output_table": table_name,
                 "WRITE_BACK": "Yes",
-
+                "write_back_type": "PROC_DATASETS_MODIFY",
                 "file_path": filepath
             })
 
+    # Generic PROC with OUT= (IMPROVED - catch other statistical procedures)
+    procs_with_out = ["univariate", "corr", "reg", "logistic", "glm", "mixed", "genmod", 
+                      "ttest", "npar1way", "anova", "glimmix", "lifereg", "phreg", 
+                      "surveyfreq", "surveymeans", "surveylogistic"]
     
-    # PROC IMPORT
+    for proc_name in procs_with_out:
+        pattern = rf'proc\s+{proc_name}\s+.*?out\s*=\s*([\w&\.]+)'
+        for match in re.finditer(pattern, code, flags=re.IGNORECASE | re.DOTALL):
+            output_table = match.group(1)
+            rows.append({
+                "statement": f"proc {proc_name} out={output_table}",
+                "output_table": output_table,
+                "WRITE_BACK": "Yes",
+                "write_back_type": f"PROC_{proc_name.upper()}",
+                "file_path": filepath
+            })
+
+    # PROC IMPORT (keep existing - NOT marked as write-back as requested)
     for match in re.finditer(
-        r'proc\s+import.*?(?:out\s*=\s*(\w+)).*?(?:datafile\s*=\s*["\'](.+?)["\'])|'
-        r'proc\s+import.*?(?:datafile\s*=\s*["\'](.+?)["\']).*?(?:out\s*=\s*(\w+))',
+        r'proc\s+import.*?(?:out\s*=\s*([\w&\.]+)).*?(?:datafile\s*=\s*["\'](.+?)["\'])|'
+        r'proc\s+import.*?(?:datafile\s*=\s*["\'](.+?)["\']).*?(?:out\s*=\s*([\w&\.]+))',
         code,
         flags=re.IGNORECASE | re.DOTALL
     ):
         out_table = match.group(1) or match.group(4)
         infile = match.group(2) or match.group(3)
         rows.append({
-        "statement": f"proc import out={out_table}",
-        "Input tables": infile,
-        "output_table": out_table,
-        "import proc": "Yes",
-        "file_path": filepath
-    })
+            "statement": f"proc import out={out_table}",
+            "Input tables": infile,
+            "output_table": out_table,
+            "import proc": "Yes",
+            "file_path": filepath
+        })
 
-   # PROC EXPORT
+    # PROC EXPORT (keep existing - NOT marked as write-back as requested)
     for match in re.findall(r'proc\s+export\s+data\s*=\s*([\w&\.]+).*?outfile\s*=\s*["\'](.+?)["\']', code, flags=re.DOTALL | re.IGNORECASE):
         rows.append({
-             "statement": f"proc export data={match[0]}",
-             "output_table": match[1],
-            "WRITE_BACK": "No",
+            "statement": f"proc export data={match[0]}",
+            "output_table": match[1],
             "export proc": "Yes",
             "file_path": filepath
-    })
-
+        })
 
     return rows
 
@@ -166,7 +243,6 @@ def main():
 
     df = pd.DataFrame(all_results)
     
-
     df.to_excel("final_analysis.xlsx", index=False)
     print(f"\n✅ Done! Extracted {len(all_results)} rows into 'final_analysis.xlsx'")
 
