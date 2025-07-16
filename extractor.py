@@ -78,7 +78,7 @@ def extract_all_blocks(code, filepath):
         first_line = sql_block.strip().splitlines()[0] if sql_block.strip() else "proc sql;"
         rows.append({
             "statement": first_line,
-            "WRITE_BACK": "Yes",
+            "PROC_SQL": "Yes",
             "file_path": filepath
         })
         
@@ -224,6 +224,132 @@ def extract_all_blocks(code, filepath):
             "file_path": filepath
         })
 
+    # DATABASE CONNECTION ANALYSIS
+    db_connections = detect_database_connections(code, filepath)
+    rows.extend(db_connections)
+
+    return rows
+
+def detect_database_connections(code, filepath):
+    """Detect database connections and potential missing connections"""
+    rows = []
+    
+    # Track found connections
+    found_connections = {
+        'libname': [],
+        'proc_sql_connect': [],
+        'proc_datasets_engine': []
+    }
+    
+    # 1. LIBNAME statements with database engines
+    db_engines = ['oracle', 'teradata', 'mysql', 'postgres', 'sqlserver', 'db2', 'netezza', 'sybase', 'odbc', 'oledb']
+    
+    for match in re.finditer(r'libname\s+(\w+)\s+(\w+)(?:\s+.*?)?;', code, flags=re.IGNORECASE | re.DOTALL):
+        libref = match.group(1)
+        engine = match.group(2).lower()
+        
+        if engine in db_engines:
+            found_connections['libname'].append(libref)
+            rows.append({
+                "statement": f"libname {libref} {engine}",
+                "DB_CONNECTION": "Yes",
+                "connection_type": f"LIBNAME_{engine.upper()}",
+                "libref": libref,
+                "engine": engine,
+                "file_path": filepath
+            })
+    
+    # 2. PROC SQL CONNECT statements
+    for match in re.finditer(r'connect\s+to\s+(\w+)(?:\s+.*?)?;', code, flags=re.IGNORECASE | re.DOTALL):
+        engine = match.group(1).lower()
+        found_connections['proc_sql_connect'].append(engine)
+        rows.append({
+            "statement": f"connect to {engine}",
+            "DB_CONNECTION": "Yes",
+            "connection_type": f"PROC_SQL_CONNECT_{engine.upper()}",
+            "engine": engine,
+            "file_path": filepath
+        })
+    
+    # 3. Look for database library references without connections
+    db_table_refs = []
+    
+    # Find all library.table references
+    for match in re.finditer(r'(?:from|join|data|set|merge|update|modify|into)\s+(\w+)\.(\w+)', code, flags=re.IGNORECASE):
+        libref = match.group(1).lower()
+        table = match.group(2)
+        
+        # Skip common SAS libraries
+        if libref not in ['work', 'sashelp', 'sasuser', 'webwork']:
+            db_table_refs.append((libref, table, match.group(0)))
+    
+    # 4. Check for missing connections
+    for libref, table, statement in db_table_refs:
+        # Check if this library has a connection defined
+        has_connection = (
+            libref in [lib.lower() for lib in found_connections['libname']] or
+            any(conn in statement.lower() for conn in found_connections['proc_sql_connect'])
+        )
+        
+        if not has_connection:
+            rows.append({
+                "statement": statement,
+                "referenced_table": f"{libref}.{table}",
+                "libref": libref,
+                "MISSING_CONNECTION": "Yes",
+                "connection_issue": "Library referenced but no connection found",
+                "file_path": filepath
+            })
+    
+    # 5. Look for PROC SQL pass-through without connections
+    passthrough_patterns = [
+        r'select\s+.*?\s+from\s+connection\s+to\s+(\w+)',
+        r'execute\s+\(.*?\)\s+by\s+(\w+)',
+        r'disconnect\s+from\s+(\w+)'
+    ]
+    
+    for pattern in passthrough_patterns:
+        for match in re.finditer(pattern, code, flags=re.IGNORECASE | re.DOTALL):
+            connection_name = match.group(1).lower()
+            
+            # Check if this connection was established
+            if connection_name not in found_connections['proc_sql_connect']:
+                rows.append({
+                    "statement": match.group(0),
+                    "connection_name": connection_name,
+                    "MISSING_CONNECTION": "Yes",
+                    "connection_issue": "Pass-through query without connection",
+                    "file_path": filepath
+                })
+    
+    # 6. Look for database-specific syntax without connections
+    db_syntax_patterns = [
+        (r'bulk\s+insert', 'SQL Server bulk insert without connection'),
+        (r'exec\s+sp_', 'SQL Server stored procedure without connection'),
+        (r'exec\s+dbms_', 'Oracle DBMS package without connection'),
+        (r'select\s+.*?\s+from\s+dual', 'Oracle DUAL table without connection')
+    ]
+    
+    for pattern, description in db_syntax_patterns:
+        for match in re.finditer(pattern, code, flags=re.IGNORECASE):
+            rows.append({
+                "statement": match.group(0),
+                "MISSING_CONNECTION": "Yes",
+                "connection_issue": description,
+                "file_path": filepath
+            })
+    
+    # 7. Summary of connections found
+    if found_connections['libname'] or found_connections['proc_sql_connect']:
+        rows.append({
+            "statement": "Connection Summary",
+            "DB_CONNECTION": "Yes",
+            "connection_type": "SUMMARY",
+            "libname_connections": ', '.join(found_connections['libname']),
+            "sql_connections": ', '.join(found_connections['proc_sql_connect']),
+            "file_path": filepath
+        })
+    
     return rows
 
 def main():
